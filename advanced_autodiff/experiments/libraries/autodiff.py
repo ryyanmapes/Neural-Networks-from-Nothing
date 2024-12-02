@@ -17,7 +17,6 @@ from numpy.lib.stride_tricks import as_strided
 
 arrayf = Type[np.ndarray[float]]
 
-# stupid wrapper because numpy array printing is stupid
 def printarr(arr):
     print("[" + ", ".join(str(item) for item in arr.flatten()) + "]")
 
@@ -110,9 +109,11 @@ class Tape():
 
         return grads
     
-    def check(self, x):
+    def check(self, x, only_positive: False):
 
         v = np.random.randn(len(x))
+        if only_positive:
+            v = np.abs(v)
 
         max_iters = 32
         h = np.zeros(max_iters)
@@ -162,13 +163,25 @@ class Tape():
         new_output = Mult(self.output_node, other.output_node)
         return Tape(new_inputs, new_output)
     
-    def __div__(self, other):
+    def __truediv__(self, other):
         new_inputs = union(self.input_nodes, other.input_nodes)
         new_output = Div(self.output_node, other.output_node)
         return Tape(new_inputs, new_output)
     
     def __pow__(self, exponent: float):
         new_output = Pow(self.output_node, exponent)
+        return Tape(self.input_nodes, new_output)
+    
+    def exp(self):
+        new_output = Exp(self.output_node)
+        return Tape(self.input_nodes, new_output)
+    
+    def log(self):
+        new_output = Log(self.output_node)
+        return Tape(self.input_nodes, new_output)
+    
+    def abs(self):
+        new_output = Abs(self.output_node)
         return Tape(self.input_nodes, new_output)
     
     def tanh(self):
@@ -221,13 +234,25 @@ class Tape():
         new_output = Reshape(self.output_node, new_size)
         return Tape(self.input_nodes, new_output)
     
+    def repeat(self, new_size):
+        new_output = Repeat(self.output_node, new_size)
+        return Tape(self.input_nodes, new_output)
+    
+    def pad(self, pad_amount):
+        new_output = Pad(self.output_node, pad_amount)
+        return Tape(self.input_nodes, new_output)
+
+    def softmax(self):
+        x = self.exp()
+        return x / x.sum().repeat(self.get_output_dimensions())
+    
     def __str__(self) -> str:
         return str(self.output_node)
     
     def __len__(self):
         return self.output_node.get_output_length()
     
-    def get_output_dimensions(self):
+    def get_output_dimensions(self) -> Tuple[int, int]:
         return self.output_node.get_output_dimensions()
 
 class AbstractOperationNode(ABC):
@@ -326,7 +351,7 @@ class Const(AbstractOperationNode):
         return self.size
 
     def __str__(self) -> str:
-        return str(self.val)
+        return str(self.val.reshape(self.size))
 
 class Var(AbstractOperationNode):
 
@@ -420,14 +445,15 @@ class Div(AbstractOperationNode):
 
     def __init__(self, a: AbstractOperationNode, b: AbstractOperationNode):
         super().__init__(a, b)
-        assert(a.get_output_dimensions() == b.get_output_dimensions())
+        # should broadcast correctly even when this isn't the case?
+        #assert(a.get_output_dimensions() == b.get_output_dimensions())
 
     def inner_run(self, inputs) -> arrayf: # returns a vector of length output length
         return self.sources[0].result / self.sources[1].result
 
     def propagate_grad(self): # assume that grad is completely setup
         self.sources[0].grad += self.grad / self.sources[1].result
-        self.sources[1].grad += (-self.grad * self.sources[0].result / (self.sources[1].result * self.sources[1].result))
+        self.sources[1].grad += -self.grad * self.sources[0].result / (self.sources[1].result ** 2)
     
     def get_output_dimensions(self) -> Tuple[int, int]:
         return self.sources[0].get_output_dimensions()
@@ -511,18 +537,69 @@ class Pow(AbstractOperationNode):
     def __str__(self) -> str:
         return "(" + str(self.sources[0]) + ")**" + str(self.exponent)
 
+class Exp(AbstractOperationNode):
+
+    def __init__(self, a: AbstractOperationNode):
+        super().__init__(a)
+
+    def inner_run(self, inputs) -> arrayf: # returns a vector of length output length
+        return np.exp(self.sources[0].result)
+    
+    def propagate_grad(self): # assume that grad is completely setup
+        self.sources[0].grad += np.exp(self.sources[0].result) * self.grad
+    
+    def get_output_dimensions(self) -> Tuple[int, int]:
+        return self.sources[0].get_output_dimensions()
+
+    def __str__(self) -> str:
+        return "e^(" + str(self.sources[0]) + ")"
+    
+class Log(AbstractOperationNode):
+
+    def __init__(self, a: AbstractOperationNode):
+        super().__init__(a)
+
+    def inner_run(self, inputs) -> arrayf: # returns a vector of length output length
+        return np.log(self.sources[0].result)
+    
+    def propagate_grad(self): # assume that grad is completely setup
+        self.sources[0].grad += np.power(self.sources[0].result, -1) * self.grad
+    
+    def get_output_dimensions(self) -> Tuple[int, int]:
+        return self.sources[0].get_output_dimensions()
+
+    def __str__(self) -> str:
+        return "log(" + str(self.sources[0]) + ")"
+
+class Abs(AbstractOperationNode):
+
+    def __init__(self, a: AbstractOperationNode):
+        super().__init__(a)
+
+    def inner_run(self, inputs) -> arrayf: # returns a vector of length output length
+        return np.abs(0, self.sources[0].result)
+    
+    def propagate_grad(self): # assume that grad is completely setup
+        self.sources[0].grad += np.where(self.sources[0].result >= 0, 1, -1) * self.grad
+    
+    def get_output_dimensions(self) -> Tuple[int, int]:
+        return self.sources[0].get_output_dimensions()
+
+    def __str__(self) -> str:
+        return "abs(" + str(self.sources[0]) + ")"
+
 # matrix-vector multiplication
 class MVMult(AbstractOperationNode):
 
-    def __init__(self, a: AbstractOperationNode, b: AbstractOperationNode):
-        super().__init__(a, b)
-        assert(a.get_output_dimensions()[1] == b.get_output_dimensions()[0])
+    def __init__(self, matrix: AbstractOperationNode, vector: AbstractOperationNode):
+        super().__init__(matrix, vector)
+        assert(matrix.get_output_dimensions()[1] == vector.get_output_dimensions()[0])
 
     def inner_run(self, inputs) -> arrayf: # returns a vector of length output length
         return (self.sources[0].get_result_matrix() @ self.sources[1].get_result_matrix()).flatten()
 
     def propagate_grad(self): # assume that grad is completely setup
-        self.sources[0].grad += np.outer(self.grad, self.sources[1].get_result_matrix()).flatten()
+        self.sources[0].grad += np.outer(self.grad, self.sources[1].get_result_matrix().flatten()).flatten()
         self.sources[1].grad += self.sources[0].get_result_matrix().transpose() @ self.grad
     
     def get_output_dimensions(self) -> Tuple[int, int]:
@@ -590,7 +667,6 @@ class Sum(AbstractOperationNode):
     def __str__(self) -> str:
         return "sum(" + str(self.sources[0]) + ")"
 
-# matrix-vector multiplication
 class Convolve(AbstractOperationNode):
     kernel_size: Tuple[int, int]
     strides: Tuple[int, int]
@@ -667,15 +743,60 @@ class Reshape(AbstractOperationNode):
     def __str__(self) -> str:
         return "{" + str(self.sources[0]) + "}"
 
+class Repeat(AbstractOperationNode):
+
+    output_size: Tuple[int, int]
+
+    def __init__(self, a: AbstractOperationNode, output_size: Tuple[int, int]):
+        super().__init__(a)
+        assert(a.get_output_dimensions() == (1, 1))
+        self.output_size = output_size
+
+    def inner_run(self, inputs) -> arrayf: # returns a vector of length output length
+        return np.repeat(self.sources[0].result, repeats=np.prod(self.output_size))
+    
+    def propagate_grad(self): # assume that grad is completely setup
+        self.sources[0].grad += np.sum(self.grad)
+    
+    def get_output_dimensions(self) -> Tuple[int, int]:
+        return self.output_size
+
+    def __str__(self) -> str:
+        return "{\{" + str(self.sources[0]) + "}\}"
+    
+class Pad(AbstractOperationNode):
+
+    pad_axes: Tuple[int, int]
+
+    def __init__(self, a: AbstractOperationNode, pad_axes: Tuple[int,int]):
+        super().__init__(a)
+        assert(pad_axes[0] >= 0 and pad_axes[1] >= 0)
+        self.pad_axes = pad_axes
+
+    def inner_run(self, inputs) -> arrayf: # returns a vector of length output length
+        return np.pad(self.sources[0].get_result_matrix(), self.pad_axes)
+    
+    def propagate_grad(self): # assume that grad is completely setup
+        self.sources[0].grad += (self.get_grad_matrix()[self.pad_axes[0]:-self.pad_axes[0], self.pad_axes[1]:-self.pad_axes[1]]).flatten()
+    
+    def get_output_dimensions(self) -> Tuple[int, int]:
+        source_dims = self.sources[0].get_output_dimensions()
+        return (source_dims[0] + 2*self.pad_axes[0], source_dims[1] + 2*self.pad_axes[1])
+
+    def __str__(self) -> str:
+        return "pad(" + str(self.sources[0]) + ", " + str(self.pad_axes) + ")"
+
 class AbstractNetworkLayer:
 
     @abstractmethod
     def forwards(self, inputs: Tape) -> Tape:
         return inputs
     
-    @abstractmethod
-    def initialize(self, parameter_count: int) -> List[float]:
-        return np.zeros(parameter_count)
+    def get_initial_parameters(self, input_size: Tuple[int, int]) -> List[float]:
+        return []
+    
+    def is_multi_layer(self) -> bool:
+        return False
 
 class ActivationFunction(Enum):
     TANH = 0
@@ -697,65 +818,81 @@ class InitializationType(Enum):
     NORMAL = 0
     UNIFORM = 1
     ZEROES = 2
+    TINY = 3
 
+TINY_EPSILON = 0.000001
 def get_initialization_variables(init_type: InitializationType, parameter_count: int) -> np.ndarray:
     if init_type == InitializationType.UNIFORM:
-        return np.random.rand(parameter_count)
+        return list(np.random.rand(parameter_count))
     elif init_type == InitializationType.NORMAL:
-        return np.random.randn(parameter_count)
+        return list(np.random.randn(parameter_count))
     elif init_type == InitializationType.ZEROES:
-        return np.zeros(parameter_count)
+        return list(np.zeros(parameter_count))
+    elif init_type == InitializationType.TINY:
+        return list(np.ones(parameter_count) * TINY_EPSILON)
     else:
-        return np.zeros(parameter_count)
+        return list(np.zeros(parameter_count))
 
+# requires a vector (n, 1)
 class SimpleLayer(AbstractNetworkLayer):
 
     output_vars: int
     activation_type: ActivationFunction
-    init_type: InitializationType
+    weight_init_type: InitializationType
+    bias_init_type: InitializationType
+    disable_bias: bool
 
-    def __init__(self, output_vars: int, activation_type: ActivationFunction = ActivationFunction.TANH, init_type: InitializationType = InitializationType.NORMAL) -> None:
+    def __init__(self, output_vars: int, activation_type: ActivationFunction = ActivationFunction.TANH, weight_init_type: InitializationType = InitializationType.NORMAL, bias_init_type: InitializationType = InitializationType.ZEROES, disable_bias: bool = False) -> None:
         super().__init__()
         self.output_vars = output_vars
         self.activation_type = activation_type
-        self.init_type = init_type
+        self.weight_init_type = weight_init_type
+        self.bias_init_type = bias_init_type
+        self.disable_bias = disable_bias
 
     def forwards(self, inputs: Tape) -> Tape:
+        assert(inputs.get_output_dimensions()[1] == 1)        
 
-        weights = Tape.Var([self.output_vars, len(inputs)])
-        biases = Tape.Var([self.output_vars, 1])
+        weights = Tape.Var([self.output_vars, inputs.get_output_dimensions()[0]])
+        if self.disable_bias:
+            return apply_activation_function(self.activation_type, weights @ inputs)
+        else:
+            biases = Tape.Var([self.output_vars, 1])
+            return apply_activation_function(self.activation_type, weights @ inputs + biases)
 
-        return apply_activation_function(self.activation_type, weights @ inputs + biases)
-    
-    def initialize(self, parameter_count: int) -> List[float]:
-        return get_initialization_variables(self.init_type, parameter_count)
+    def get_initial_parameters(self, input_size: Tuple[int, int]) -> List[float]:
+        return get_initialization_variables(self.weight_init_type, self.output_vars*input_size[0]) + ([] if self.disable_bias else get_initialization_variables(self.bias_init_type, self.output_vars))
 
-
+# requires a matrix (n, m)
 class ConvolutionLayer(AbstractNetworkLayer):
 
-    image_shape: Tuple[int, int]
     stencil_shape: Tuple[int, int]
     strides: Tuple[int, int]
     activation_type: ActivationFunction
     init_type: InitializationType
+    pre_padding: Tuple[int, int]
 
-    def __init__(self, image_shape: Tuple[int, int], stencil_shape: Tuple[int, int], strides: Tuple[int, int], activation_type: ActivationFunction = None, init_type: InitializationType = InitializationType.NORMAL) -> None:
+    def __init__(self, stencil_shape: Tuple[int, int], strides: Tuple[int, int], activation_type: ActivationFunction = None, init_type: InitializationType = InitializationType.NORMAL, pre_padding: Tuple[int, int] = (0,0)) -> None:
         super().__init__()
-        self.image_shape = image_shape
         self.stencil_shape = stencil_shape
         self.strides = strides
         self.activation_type = activation_type
         self.init_type = init_type
+        self.pre_padding = pre_padding
 
     def forwards(self, inputs: Tape) -> Tape:
+        acc = inputs
+
+        if self.pre_padding != (0,0):
+            acc = acc.pad(self.pre_padding)
 
         stencil = Tape.Var([self.stencil_shape[0], self.stencil_shape[1]])
+        acc = acc.convolve(stencil, self.strides)
 
-        convolved = inputs.convolve(stencil, self.strides)
-        return apply_activation_function(self.activation_type, convolved)
+        return apply_activation_function(self.activation_type, acc)
     
-    def initialize(self, parameter_count: int) -> List[float]:
-        return get_initialization_variables(self.init_type, parameter_count)
+    def get_initial_parameters(self, input_size: Tuple[int, int]) -> List[float]:
+        return get_initialization_variables(self.init_type, np.prod(self.stencil_shape))
 
 class ReshapeLayer(AbstractNetworkLayer):
     
@@ -767,19 +904,142 @@ class ReshapeLayer(AbstractNetworkLayer):
 
     def forwards(self, inputs: Tape) -> Tape:
         return inputs.reshape(self.output_size)
+
+class SplitLayer(AbstractNetworkLayer):
     
-    def initialize(self, parameter_count: int) -> List[float]:
-        return []
+    output_copies: int
+
+    def __init__(self, output_copies: int):
+        super().__init__()
+        self.output_copies = output_copies
+
+    def forwards(self, inputs: Tape) -> Tape:
+        assert(len(inputs) == 1)
+        return inputs * self.output_copies
+    
+    def is_multi_layer(self) -> bool:
+        return True
+    
+class MergeLayer(AbstractNetworkLayer):
+
+    def __init__(self):
+        super().__init__()
+
+    def forwards(self, inputs: Tape) -> Tape:
+        return [Tape.Combine(inputs)]
+    
+    def is_multi_layer(self) -> bool:
+        return True
+
+
+
+class AbstractOptimizer(ABC):
+
+    parameters: np.ndarray = None # theta
+
+    @abstractmethod
+    def __init__(self) -> None:
+        super().__init__()
+
+    def get_parameters(self):
+        return self.parameters
+
+    def init(self, initial_parameters: np.ndarray):
+        self.parameters = initial_parameters
+
+    @abstractmethod
+    def update(self, gradients: np.ndarray):
+        pass
+
+class SimpleOptimizer(AbstractOptimizer):
+
+    learning_rate: float
+
+    def __init__(self, learning_rate: float) -> None:
+        self.learning_rate = learning_rate
+        super().__init__()
+
+    def update(self, gradients: np.ndarray):
+        self.parameters -= self.learning_rate * gradients
+
+class MomentumOptimizer(AbstractOptimizer):
+
+    learning_rate: float
+    momentum_decay: float
+
+    previous_update: np.ndarray
+
+    def __init__(self, learning_rate: float, momentum_decay: float) -> None:
+        self.learning_rate = learning_rate
+        self.momentum_decay = momentum_decay
+        super().__init__()
+
+    def init(self, initial_parameters: np.ndarray):
+        self.previous_update = np.zeros(initial_parameters.shape)
+        super().init(initial_parameters)
+
+    def update(self, gradients: np.ndarray):
+        self.previous_update = self.momentum_decay * self.previous_update - self.learning_rate * gradients
+        self.parameters += self.previous_update
+
+ADAM_EPSILON = 10.0**-8
+class AdamOptimizer(AbstractOptimizer):
+    
+    learning_rate: float
+    first_moment_forgetting_factor: float # beta 1
+    second_moment_forgetting_factor: float # beta 2
+
+    steps: int
+    first_moment: np.ndarray
+    second_moment: np.ndarray
+
+    def __init__(self, learning_rate: float, first_moment_forgetting_factor: float, second_moment_forgetting_factor: float) -> None:
+        self.learning_rate = learning_rate
+        self.first_moment_forgetting_factor = first_moment_forgetting_factor
+        self.second_moment_forgetting_factor = second_moment_forgetting_factor
+        super().__init__()
+
+    def init(self, initial_parameters: np.ndarray):
+        self.steps = 1
+        self.first_moment = np.zeros(initial_parameters.shape)
+        self.second_moment = np.zeros(initial_parameters.shape)
+        super().init(initial_parameters)
+
+    def update(self, gradients: np.ndarray):
+        self.first_moment = self.first_moment_forgetting_factor * self.first_moment \
+            + (1 - self.first_moment_forgetting_factor) * gradients
+        self.second_moment = self.second_moment_forgetting_factor * self.second_moment \
+            + (1 - self.second_moment_forgetting_factor) * gradients**2
+        debiased_first_moment = self.first_moment / (1 - self.first_moment_forgetting_factor**self.steps)
+        debiased_second_moment = self.second_moment / (1 - self.second_moment_forgetting_factor**self.steps)
+        self.parameters = self.parameters - self.learning_rate * (debiased_first_moment / (np.sqrt(debiased_second_moment) + ADAM_EPSILON))
+        self.steps += 1
+
+class LossType(Enum):
+    L1 = 0
+    L2 = 1
+    CROSS_ENTROPY = 2
+
+def apply_loss(loss_type: LossType, actual: Tape, expected: Tape) -> np.ndarray:
+    if loss_type == LossType.L1:
+        return (actual - expected).abs().sum()
+    elif loss_type == LossType.L2:
+        return (actual - expected).square().sum().scale(0.5)
+    elif loss_type == LossType.CROSS_ENTROPY:
+        return (expected * actual.softmax().log()).sum().scale(-1)
+    else:
+        return (actual - expected).abs().sum()
 
 class NeuralNetwork:
 
     input_size: Tuple[int, int]
     layers: List[AbstractNetworkLayer]
-    learning_rate: float
+    loss_type: LossType
+    optimizer: AbstractOptimizer
     weight_decay_rate: float
     weight_decay_exp: float
 
-    layer_parameter_sizes: List[int]
+    layer_input_sizes: List[List[Tuple[int, int]]]
     total_parameters: int
     output_count: int
 
@@ -788,35 +1048,38 @@ class NeuralNetwork:
     expected_outputs: Tape
     cost = None
 
-    current_parameters = []
-
-    def __init__(self, input_size: Tuple[int, int], layers: List[AbstractNetworkLayer], learning_rate: float, weight_decay_rate: float = 0, weight_decay_exp: float = 1) -> None:
+    def __init__(self, input_size: Tuple[int, int], layers: List[AbstractNetworkLayer], loss_type: LossType, optimizer: AbstractOptimizer, weight_decay_rate: float = 0, weight_decay_exp: float = 1) -> None:
         self.input_size = input_size
         self.layers = layers
-        self.learning_rate = learning_rate
+        self.loss_type = loss_type
+        self.optimizer = optimizer
         self.weight_decay_rate = weight_decay_rate
         self.weight_decay_exp = weight_decay_exp
 
         # this is jank, we should find a better way of doing this
         Tape.VARIABLE_INDICES = 0
-        old_variable_indices = 0
-        self.layer_parameter_sizes = []
+        self.layer_input_sizes = [[input_size]]
 
-        tape = Tape.Const(np.zeros(self.input_size))
-        self.input_layer = tape
+        tapes: List[Tape] = [Tape.Const(np.zeros(self.input_size))]
+        self.input_layer = tapes[0]
 
         for layer in self.layers:
-            tape = layer.forwards(tape)
 
-            self.layer_parameter_sizes.append(Tape.VARIABLE_INDICES - old_variable_indices)
-            old_variable_indices = Tape.VARIABLE_INDICES
+            if layer.is_multi_layer():
+                tapes = layer.forwards(tapes)
+            else:
+                tapes = [layer.forwards(tape) for tape in tapes]
 
-        self.output_layer = tape
-        self.total_parameters = sum(self.layer_parameter_sizes)
-        self.output_count = len(tape)
+            self.layer_input_sizes.append([tape.get_output_dimensions() for tape in tapes])
+            print(str(tapes[0].get_output_dimensions()) + " x " + str(len(tapes)))
 
-        self.expected_outputs = Tape.Const(np.zeros(self.output_count))
-        self.cost = (tape - self.expected_outputs).square().sum().scale(0.5)
+        assert(len(tapes) == 1)
+        self.output_layer = tapes[0]
+        self.total_parameters = self.output_layer.input_parameter_count
+        self.output_count = len(self.output_layer)
+
+        self.expected_outputs = Tape.Const(np.zeros((self.output_count, 1)))
+        self.cost = apply_loss(self.loss_type, self.output_layer, self.expected_outputs)
 
         if self.weight_decay_rate != 0:
             self.cost = self.cost + self.cost.sum_all_variables(lambda x: x**weight_decay_exp).sum().scale(self.weight_decay_rate / self.weight_decay_exp)
@@ -824,9 +1087,15 @@ class NeuralNetwork:
         self.reset_parameters()
 
     def reset_parameters(self):
-        self.current_parameters = []
+        new_parameters = []
         for i in range(len(self.layers)):
-            self.current_parameters.extend(self.layers[i].initialize(self.layer_parameter_sizes[i]))
+            layer = self.layers[i]
+            for j in range(len(self.layer_input_sizes[i])):
+                new_parameters += layer.get_initial_parameters(self.layer_input_sizes[i][j])
+        self.optimizer.init(np.array(new_parameters))
+
+    def get_parameters(self):
+        return self.optimizer.get_parameters()
 
     def set_inputs(self, inputs: arrayf):
         self.input_layer.output_node.val = inputs
@@ -835,35 +1104,34 @@ class NeuralNetwork:
         self.expected_outputs.output_node.val = expected_outputs
 
     # sanity check
-    def check(self, inputs: arrayf):
+    def check(self, inputs: arrayf, only_positive: False):
         self.set_inputs(inputs)
-        self.cost.check(self.current_parameters)
+        self.cost.check(self.get_parameters(), only_positive)
 
     def forwards(self, inputs: arrayf) -> arrayf:
         self.set_inputs(inputs)
-        return self.output_layer.forwards(self.current_parameters)
+        return self.output_layer.forwards(self.get_parameters())
 
     def get_cost(self, inputs: arrayf, expected_output: arrayf) -> float:
         self.set_inputs(inputs)
         self.set_expected_outputs(expected_output)
-        return self.cost.forwards(self.current_parameters)
+        return self.cost.forwards(self.get_parameters())
 
     def train(self, inputs: arrayf, expected_outputs: arrayf):
 
         self.get_cost(inputs, expected_outputs)
         grads = self.cost.backwards_from_last_forwards()
-        self.current_parameters -= self.learning_rate * grads
+        self.optimizer.update(grads)
     
     def train_batch(self, inputs: List[arrayf], expected_outputs: List[arrayf]):
         batch_size = len(inputs)
-        
-        total_grads = 0
+
+        grads = np.zeros((batch_size, self.total_parameters))
         for i in range(0, batch_size):
 
             self.get_cost(inputs[i], expected_outputs[i])
-            grads = self.cost.backwards_from_last_forwards()
-            total_grads += grads
+            grads[i,:] = self.cost.backwards_from_last_forwards()
 
-        self.current_parameters -= self.learning_rate * total_grads / batch_size
+        self.optimizer.update(np.sum(grads, axis=0) / batch_size)
         
         
