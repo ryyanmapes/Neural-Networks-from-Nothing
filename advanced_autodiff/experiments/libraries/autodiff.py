@@ -914,7 +914,6 @@ class SplitLayer(AbstractNetworkLayer):
         self.output_copies = output_copies
 
     def forwards(self, inputs: Tape) -> Tape:
-        assert(len(inputs) == 1)
         return inputs * self.output_copies
     
     def is_multi_layer(self) -> bool:
